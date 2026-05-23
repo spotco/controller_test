@@ -16,6 +16,7 @@ hid-playstation:
 from __future__ import annotations
 
 import argparse
+import ctypes
 import time
 import zlib
 from collections import Counter
@@ -43,6 +44,16 @@ BATTERY_STATUS_FULL = 11
 
 PS_INPUT_CRC32_SEED = 0xA1
 PS_OUTPUT_CRC32_SEED = 0xA2
+
+USB_OUTPUT_REPORT = 0x05
+USB_OUTPUT_REPORT_SIZE = 32
+BT_OUTPUT_REPORT = 0x11
+BT_OUTPUT_REPORT_SIZE = 78
+BT_OUTPUT_REPORT_HEADER_SIZE = 3
+
+DS4_OUTPUT_VALID_FLAG_RUMBLE = 0x01
+DS4_OUTPUT_SMALL_MOTOR_OFFSET = 3
+DS4_OUTPUT_LARGE_MOTOR_OFFSET = 4
 
 
 @dataclass(frozen=True)
@@ -85,6 +96,35 @@ def valid_bt_input_crc(report: list[int]) -> bool:
     return actual == expected
 
 
+def make_bt_output_report(
+    small_motor: int = 0, large_motor: int = 0, set_rumble: bool = False
+) -> bytes:
+    report = bytearray(BT_OUTPUT_REPORT_SIZE)
+    report[0] = BT_OUTPUT_REPORT
+    report[1] = 0xC0  # HID output data is present, report includes CRC32.
+    report[2] = 0x00
+    common_offset = BT_OUTPUT_REPORT_HEADER_SIZE
+    if set_rumble:
+        report[common_offset] = DS4_OUTPUT_VALID_FLAG_RUMBLE
+    report[common_offset + DS4_OUTPUT_SMALL_MOTOR_OFFSET] = small_motor
+    report[common_offset + DS4_OUTPUT_LARGE_MOTOR_OFFSET] = large_motor
+    crc = ds4_crc32(PS_OUTPUT_CRC32_SEED, report[:-4])
+    report[-4:] = crc.to_bytes(4, "little")
+    return bytes(report)
+
+
+def make_usb_output_report(
+    small_motor: int = 0, large_motor: int = 0, set_rumble: bool = False
+) -> bytes:
+    report = bytearray(USB_OUTPUT_REPORT_SIZE)
+    report[0] = USB_OUTPUT_REPORT
+    if set_rumble:
+        report[1] = DS4_OUTPUT_VALID_FLAG_RUMBLE
+    report[1 + DS4_OUTPUT_SMALL_MOTOR_OFFSET] = small_motor
+    report[1 + DS4_OUTPUT_LARGE_MOTOR_OFFSET] = large_motor
+    return bytes(report)
+
+
 def make_bt_enable_report() -> bytes:
     """Build a no-op Bluetooth output report with a valid CRC.
 
@@ -93,13 +133,45 @@ def make_bt_enable_report() -> bytes:
     use the full Bluetooth report stream without changing LED or rumble state.
     """
 
-    report = bytearray(BT_INPUT_REPORT_SIZE)
-    report[0] = 0x11
-    report[1] = 0xC0  # HID output data is present, report includes CRC32.
-    report[2] = 0x00
-    crc = ds4_crc32(PS_OUTPUT_CRC32_SEED, report[:-4])
-    report[-4:] = crc.to_bytes(4, "little")
-    return bytes(report)
+    return make_bt_output_report()
+
+
+def pulse_controller(
+    device_info: dict, report_id: int, duration_seconds: float = 0.25
+) -> bool:
+    """Pulse the detected DualShock 4 for a very short time."""
+
+    if report_id == BT_INPUT_REPORT:
+        pulse = make_bt_output_report(
+            small_motor=0x40, large_motor=0x40, set_rumble=True
+        )
+        stop = make_bt_output_report(set_rumble=True)
+    elif report_id == USB_INPUT_REPORT:
+        pulse = make_usb_output_report(
+            small_motor=0x40, large_motor=0x40, set_rumble=True
+        )
+        stop = make_usb_output_report(set_rumble=True)
+    else:
+        return False
+
+    dev = open_device(device_info)
+    try:
+        try:
+            if dev.write(pulse) <= 0:
+                return False
+        except OSError:
+            return False
+
+        time.sleep(duration_seconds)
+
+        try:
+            dev.write(stop)
+        except OSError:
+            pass
+
+        return True
+    finally:
+        dev.close()
 
 
 def decode_status(report: list[int]) -> BatteryReading | None:
@@ -224,6 +296,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    print("DualShock 4 Battery Reader")
+    print()
+
     try:
         global hid
         import hid
@@ -233,9 +308,6 @@ def main() -> int:
         return 1
 
     devices = dualshock4_devices()
-
-    print("DualShock 4 Battery Reader")
-    print()
 
     if not devices:
         print("No DualShock 4 HID device found.")
@@ -269,6 +341,10 @@ def main() -> int:
         print(f"Samples:       {agreed} of {len(readings)} agreed ({confidence}%)")
         print(f"Report:        0x{reading.report_id:02x}, {reading.report_size} bytes")
         print(f"Status byte:   0x{reading.raw_status:02x}")
+        if pulse_controller(device, reading.report_id):
+            print("Controller:    Brief rumble pulse sent")
+        else:
+            print("Controller:    Detected, but no rumble pulse was available")
         return 0
 
     print()
