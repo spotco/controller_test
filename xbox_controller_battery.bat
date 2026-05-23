@@ -2,7 +2,7 @@
 echo Running Xbox Controller Battery Reader...
 echo.
 
-python "%~dp0xbox_battery_winrt.py"
+python "%~dp0xbox_controller_battery.py"
 
 echo.
 pause
