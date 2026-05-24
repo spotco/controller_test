@@ -20,6 +20,18 @@ from dataclasses import dataclass
 MICROSOFT_VENDOR_ID = "045e"
 BATTERY_SERVICE_UUID = "0000180f-0000-1000-8000-00805f9b34fb"
 BATTERY_LEVEL_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
+ERROR_SUCCESS = 0
+
+BATTERY_TYPE_DISCONNECTED = 0x00
+BATTERY_TYPE_WIRED = 0x01
+BATTERY_TYPE_ALKALINE = 0x02
+BATTERY_TYPE_NIMH = 0x03
+BATTERY_TYPE_UNKNOWN = 0xFF
+
+BATTERY_LEVEL_EMPTY = 0x00
+BATTERY_LEVEL_LOW = 0x01
+BATTERY_LEVEL_MEDIUM = 0x02
+BATTERY_LEVEL_FULL = 0x03
 
 
 @dataclass(frozen=True)
@@ -28,10 +40,43 @@ class XboxController:
     name: str
 
 
+@dataclass(frozen=True)
+class XInputSlot:
+    user_index: int
+    battery_type: int | None
+    battery_level: int | None
+
+
 class XINPUT_VIBRATION(ctypes.Structure):
     _fields_ = [
         ("wLeftMotorSpeed", ctypes.c_ushort),
         ("wRightMotorSpeed", ctypes.c_ushort),
+    ]
+
+
+class XINPUT_GAMEPAD(ctypes.Structure):
+    _fields_ = [
+        ("wButtons", ctypes.c_ushort),
+        ("bLeftTrigger", ctypes.c_ubyte),
+        ("bRightTrigger", ctypes.c_ubyte),
+        ("sThumbLX", ctypes.c_short),
+        ("sThumbLY", ctypes.c_short),
+        ("sThumbRX", ctypes.c_short),
+        ("sThumbRY", ctypes.c_short),
+    ]
+
+
+class XINPUT_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPacketNumber", ctypes.c_uint),
+        ("Gamepad", XINPUT_GAMEPAD),
+    ]
+
+
+class XINPUT_BATTERY_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BatteryType", ctypes.c_ubyte),
+        ("BatteryLevel", ctypes.c_ubyte),
     ]
 
 
@@ -51,16 +96,88 @@ def controller_label(controller: XboxController) -> str:
     return f"{controller.name} ({controller.device_id})"
 
 
-def pulse_xinput_controller(duration_seconds: float = 0.25) -> bool:
-    """Pulse the first connected XInput controller for a very short time."""
-
+def load_xinput():
     try:
-        xinput = ctypes.WinDLL("xinput1_4.dll")
+        return ctypes.WinDLL("xinput1_4.dll")
     except OSError:
         try:
-            xinput = ctypes.WinDLL("xinput9_1_0.dll")
+            return ctypes.WinDLL("xinput9_1_0.dll")
         except OSError:
-            return False
+            return None
+
+
+def battery_type_label(battery_type: int | None) -> str:
+    return {
+        BATTERY_TYPE_DISCONNECTED: "disconnected",
+        BATTERY_TYPE_WIRED: "wired",
+        BATTERY_TYPE_ALKALINE: "alkaline",
+        BATTERY_TYPE_NIMH: "rechargeable",
+        BATTERY_TYPE_UNKNOWN: "unknown",
+        None: "unavailable",
+    }.get(battery_type, f"0x{battery_type:02x}")
+
+
+def battery_level_label(battery_level: int | None) -> str:
+    return {
+        BATTERY_LEVEL_EMPTY: "empty",
+        BATTERY_LEVEL_LOW: "low",
+        BATTERY_LEVEL_MEDIUM: "medium",
+        BATTERY_LEVEL_FULL: "full",
+        None: "unavailable",
+    }.get(battery_level, f"0x{battery_level:02x}")
+
+
+def get_connected_xinput_slots() -> list[XInputSlot]:
+    xinput = load_xinput()
+    if xinput is None:
+        return []
+
+    get_state = xinput.XInputGetState
+    get_state.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_STATE)]
+    get_state.restype = ctypes.c_uint
+
+    get_battery = xinput.XInputGetBatteryInformation
+    get_battery.argtypes = [
+        ctypes.c_uint,
+        ctypes.c_ubyte,
+        ctypes.POINTER(XINPUT_BATTERY_INFORMATION),
+    ]
+    get_battery.restype = ctypes.c_uint
+
+    connected_slots: list[XInputSlot] = []
+    for user_index in range(4):
+        state = XINPUT_STATE()
+        if get_state(user_index, ctypes.byref(state)) != ERROR_SUCCESS:
+            continue
+
+        battery = XINPUT_BATTERY_INFORMATION()
+        battery_result = get_battery(user_index, 0, ctypes.byref(battery))
+        if battery_result == ERROR_SUCCESS:
+            battery_type = int(battery.BatteryType)
+            battery_level = int(battery.BatteryLevel)
+        else:
+            battery_type = None
+            battery_level = None
+
+        connected_slots.append(
+            XInputSlot(
+                user_index=user_index,
+                battery_type=battery_type,
+                battery_level=battery_level,
+            )
+        )
+
+    return connected_slots
+
+
+def pulse_xinput_controllers(
+    slots: list[XInputSlot], duration_seconds: float = 0.25
+) -> list[int]:
+    """Pulse all connected XInput slots for a very short time."""
+
+    xinput = load_xinput()
+    if xinput is None:
+        return []
 
     set_state = xinput.XInputSetState
     set_state.argtypes = [ctypes.c_uint, ctypes.POINTER(XINPUT_VIBRATION)]
@@ -68,17 +185,22 @@ def pulse_xinput_controller(duration_seconds: float = 0.25) -> bool:
 
     stop = XINPUT_VIBRATION(0, 0)
     pulse = XINPUT_VIBRATION(0x4000, 0x4000)
+    pulsed_slots: list[int] = []
 
-    for user_index in range(4):
-        result = set_state(user_index, ctypes.byref(pulse))
-        if result != 0:
+    for slot in slots:
+        result = set_state(slot.user_index, ctypes.byref(pulse))
+        if result != ERROR_SUCCESS:
             continue
 
-        time.sleep(duration_seconds)
-        set_state(user_index, ctypes.byref(stop))
-        return True
+        pulsed_slots.append(slot.user_index)
 
-    return False
+    if not pulsed_slots:
+        return []
+
+    time.sleep(duration_seconds)
+    for user_index in pulsed_slots:
+        set_state(user_index, ctypes.byref(stop))
+    return pulsed_slots
 
 
 def looks_like_xbox_controller(device_id: str, name: str) -> bool:
@@ -187,6 +309,8 @@ async def async_main(args: argparse.Namespace) -> int:
             print(f"{index}. {controller_label(controller)}")
         return 0
 
+    xinput_slots = get_connected_xinput_slots()
+
     last_error: Exception | None = None
 
     for controller in controllers:
@@ -205,8 +329,21 @@ async def async_main(args: argparse.Namespace) -> int:
         print()
         print(f"Battery Level: {level}%")
         print("Source:        Bluetooth LE GATT Battery Service")
-        if pulse_xinput_controller():
-            print("Controller:    Brief rumble pulse sent")
+        if xinput_slots:
+            slot_summary = ", ".join(
+                f"{slot.user_index} ({battery_type_label(slot.battery_type)}/{battery_level_label(slot.battery_level)})"
+                for slot in xinput_slots
+            )
+            print(f"XInput Slots:   {slot_summary}")
+        else:
+            print("XInput Slots:   None detected")
+
+        pulsed_slots = pulse_xinput_controllers(xinput_slots)
+        if pulsed_slots:
+            slot_list = ", ".join(str(slot) for slot in pulsed_slots)
+            print(f"Controller:    Brief rumble pulse sent to XInput slot(s) {slot_list}")
+            if len(pulsed_slots) > 1:
+                print("Note:          More than one XInput controller is active, so rumble target is ambiguous")
         else:
             print("Controller:    Detected, but no XInput rumble pulse was available")
         return 0
